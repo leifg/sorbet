@@ -1369,6 +1369,8 @@ private:
                         ctx.state.deleteFieldSymbol(oldSymbol.asFieldRef());
                         break;
                     case core::SymbolRef::Kind::TypeMember:
+                        ctx.state.deleteTypeMemberSymbol(oldSymbol.asTypeMemberRef());
+                        break;
                     case core::SymbolRef::Kind::ClassOrModule:
                     case core::SymbolRef::Kind::TypeArgument:
                         ENFORCE(false);
@@ -1376,6 +1378,25 @@ private:
                 }
             }
         }
+    }
+
+    void deleteStaticFieldViaFullNameHash(core::MutableContext ctx, const core::FoundStaticFieldHash &oldDefHash) {
+        ENFORCE(oldDefHash.nameHash.isDefined(), "Can't delete rename if old hash is not defined");
+
+        auto owner = getOwnerSymbol(oldDefHash.owner());
+        deleteSymbolViaFullNameHash(ctx, owner, oldDefHash.nameHash);
+    }
+
+    void deleteTypeMemberViaFullNameHash(core::MutableContext ctx, const core::FoundTypeMemberHash &oldDefHash) {
+        ENFORCE(oldDefHash.nameHash.isDefined(), "Can't delete rename if old hash is not defined");
+
+        // Changes to classes/modules take the slow path, so getOwnerSymbol is okay to call here
+        auto owner = getOwnerSymbol(oldDefHash.owner());
+        if (oldDefHash.isTypeTemplate) {
+            owner = owner.data(ctx)->singletonClass(ctx);
+        }
+
+        deleteSymbolViaFullNameHash(ctx, owner, oldDefHash.nameHash);
     }
 
     void deleteFieldViaFullNameHash(core::MutableContext ctx, const core::FoundFieldHash &oldDefHash) {
@@ -1404,10 +1425,17 @@ private:
         if (oldFoundHashes.has_value()) {
             const auto &oldFoundHashesVal = oldFoundHashes.value();
 
+            for (const auto &oldStaticFieldHash : oldFoundHashesVal.staticFieldHashes) {
+                deleteStaticFieldViaFullNameHash(ctx, oldStaticFieldHash);
+            }
+
+            for (const auto &oldTypeMemberHash : oldFoundHashesVal.typeMemberHashes) {
+                deleteTypeMemberViaFullNameHash(ctx, oldTypeMemberHash);
+            }
+
             for (const auto &oldFieldHash : oldFoundHashesVal.fieldHashes) {
-                if (oldFieldHash.isInstanceVariable) {
-                    deleteFieldViaFullNameHash(ctx, oldFieldHash);
-                }
+                // TODO(jez) Add a test for `@@x = 1`. Technically a static field, but shows up in old fieldHashes
+                deleteFieldViaFullNameHash(ctx, oldFieldHash);
             }
 
             for (const auto &oldMethodHash : oldFoundHashesVal.methodHashes) {
@@ -1432,6 +1460,18 @@ public:
         for (const auto &klass : foundDefs.klasses()) {
             state.definedClasses.emplace_back(insertClass(ctx.withOwner(getOwnerSymbol(klass.owner)), klass));
         }
+    }
+
+    SymbolDefiner::State deleteOldDefinitions(core::MutableContext ctx) {
+        deleteOldDefinitionsInternal(ctx);
+        return move(state);
+    }
+
+    void enterNewDefinitions(core::MutableContext ctx) {
+        // We have to defer defining "deletable" symbols until this (second) phase of incremental
+        // namer so that we don't delete and immediately re-enter a symbol (possibly keeping it
+        // alive, if it had multiple locs at the time of deletion) before SymbolDefiner has had a
+        // chance to process _all_ files.
 
         for (auto ref : foundDefs.deletableDefinitions()) {
             switch (ref.kind()) {
@@ -1454,22 +1494,7 @@ public:
                     break;
             }
         }
-    }
 
-    SymbolDefiner::State deleteOldDefinitions(core::MutableContext ctx) {
-        deleteOldDefinitionsInternal(ctx);
-        return move(state);
-    }
-
-    void enterNewDefinitions(core::MutableContext ctx) {
-        // TODO(jez) After everything but classes is handled on the fast path, I think we can go
-        // back to having a single list of (non-class) definitions with a switch statement, like how
-        // namer used to work.
-
-        // We have to defer defining "deletable" symbols until this (second) phase of incremental
-        // namer so that we don't delete and immediately re-enter a symbol (possibly keeping it
-        // alive, if it had multiple locs at the time of deletion) before SymbolDefiner has had a
-        // chance to process _all_ files.
         for (auto &method : foundDefs.methods()) {
             if (method.arityHash.isAliasMethod()) {
                 // We need alias methods in the FoundDefinitions list not so that we can actually
